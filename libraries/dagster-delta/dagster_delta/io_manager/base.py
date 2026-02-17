@@ -2,7 +2,7 @@ import sys
 from abc import abstractmethod
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional, TypedDict, Union, cast
 
@@ -23,6 +23,7 @@ from dagster._core.storage.db_io_manager import (
 from pydantic import Field
 
 from dagster_delta._db_io_manager import CustomDbIOManager
+from abc import ABC
 
 if sys.version_info >= (3, 11):
     from typing import NotRequired
@@ -42,11 +43,73 @@ DELTA_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 DELTA_DATE_FORMAT = "%Y-%m-%d"
 
 
+# @dataclass(frozen=True)
+class DataCatalog(ABC):
+
+    @abstractmethod
+    def get_storage_options(table_uri) -> dict[str,str]:
+        ...
+
+    @abstractmethod
+    def register_table(
+        # self,
+        table_uri: str,
+        database: str,
+        schema: str,
+        table: str
+    ) -> None:
+        """
+        Should implement logic to register external table_uri in DataCatalog.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def replace_schema() -> None:
+        """
+        Basically drop table from UC and register again.
+        Make sure column types are properly reflected in UC table overview.
+        """
+        raise NotImplementedError
+
+
 @dataclass(frozen=True)
 class TableConnection:  # noqa: D101
     table_uri: str
-    storage_options: dict[str, str]
     table_config: Optional[dict[str, str]]
+
+    @property
+    @abstractmethod
+    def storage_options(self) -> dict[str, str]: ...
+
+    @property
+    def catalog(self) -> Optional[DataCatalog]:
+        return None
+
+
+@dataclass(frozen=True)
+class StaticTableConnection(TableConnection):  # noqa: D101
+    _storage_options: dict[str, str]
+
+    @property
+    def storage_options(self) -> dict[str, str]:
+        return self._storage_options
+
+
+@dataclass(frozen=True)
+class DataCatalogTableConnection(TableConnection):  # noqa: D101
+    _catalog: DataCatalog
+    _storage_options: Optional[dict[str, str]] = field(default_factory=dict)
+
+    @property
+    def catalog(self) -> DataCatalog:
+        return self._catalog
+
+    @property
+    def storage_options(self):
+        return {
+            **self._storage_options,
+            **self.catalog.get_storage_options(self.table_uri)
+        }
 
 
 class _StorageOptionsConfig(TypedDict, total=False):
@@ -252,6 +315,7 @@ class DeltaLakeDbClient(DbClient):  # noqa: D101
 
         # Values of a config are unpacked into a dict[str,Any], we convert it back to the Config
         # so that we can do str_dict()
+        data_catalog = None
         if "local" in storage_options:
             storage_options = LocalConfig(**storage_options["local"])  # type: ignore
         elif "s3" in storage_options:
@@ -260,6 +324,10 @@ class DeltaLakeDbClient(DbClient):  # noqa: D101
             storage_options = AzureConfig(**storage_options["azure"])  # type: ignore
         elif "gcs" in storage_options:
             storage_options = GcsConfig(**storage_options["gcs"])  # type: ignore
+        elif "databricks" in storage_options:
+            data_catalog = None
+            storage_options = {}
+            raise NotImplementedError("Databricks Config is not yet implemented.")
         else:
             raise NotImplementedError("No valid storage_options config found.")
 
@@ -276,11 +344,20 @@ class DeltaLakeDbClient(DbClient):  # noqa: D101
             table_uri = f"{root_uri}/{table_slice.schema}/{table_slice.table}"
         else:
             table_uri = f"{root_uri}/{table_slice.table}"
-        conn = TableConnection(
-            table_uri=table_uri,
-            storage_options=options or {},
-            table_config=table_config,
-        )
+
+        if data_catalog:
+            conn = DataCatalogTableConnection(
+                table_uri=table_uri,
+                table_config=table_config,
+                _catalog=data_catalog,
+                _storage_options=options or {}
+            )
+        else:
+            conn = StaticTableConnection(
+                table_uri=table_uri,
+                _storage_options=options or {},
+                table_config=table_config,
+            )
 
         yield conn
 
